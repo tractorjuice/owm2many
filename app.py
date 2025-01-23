@@ -6,6 +6,10 @@ from pyvis.network import Network
 import yaml
 import networkx as nx
 from github import Github
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from matplotlib import rc
+from IPython.display import HTML
 from wardley_map import (
     create_wardley_map_plot,
     get_owm_map,
@@ -17,10 +21,18 @@ from wardley_map import (
     parse_wardley_map
 )
 
+import matplotlib
+matplotlib.use("Agg")  # Safe for Streamlit
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from io import BytesIO
+import numpy as np
+import time
+
 API_ENDPOINT = "https://api.onlinewardleymaps.com/v1/maps/fetch?id="
 GITHUB = st.secrets["GITHUB"]
 GITHUBREPO = "swardley/MAP-REPOSITORY"
-DEBUG = True  # True to overwrite files that already exist
+DEBUG = False  # True to overwrite files that already exist
 MAP_ID = None
 
 # Dictionary of map IDs with user-friendly names
@@ -63,8 +75,9 @@ with st.sidebar:
             "WM to CYPHER",
             "WM to GML",
             "JSON to TOML",
+            "Animate Map"  # New option for animation
         ],
-        icons=["gear"] * 6,
+        icons=["gear"] * 7,
         menu_icon="robot",
         default_index=0,
     )
@@ -637,3 +650,158 @@ elif selected == "WM to YAML":
     )
 
     st.code(wardley_map_yaml, language="yaml")
+
+elif selected == "Animate Map":
+    st.title("Wardley Map Animation")
+
+    # Make sure we have the parsed map
+    parsed_map = parse_wardley_map(st.session_state.map_text)
+
+    # Let the user pick an animation type
+    animation_type = st.selectbox(
+        "Animation Type",
+        ["Components"]
+    )
+
+    # Let the user pick animation speed (milliseconds per frame)
+    animation_speed = st.slider("Animation speed (ms per frame)", 100, 1000, 500, step=100)
+
+    # Build the graph (similar to your other code)
+    G = nx.DiGraph()
+    evolution_colors = {
+        "genesis": "#FF5733",
+        "custom": "#33FF57",
+        "product": "#3357FF",
+        "commodity": "#F333FF"
+    }
+
+    # Identify anchors (nodes with no incoming edges) and normal components
+    def identify_node_types(graph, components):
+        anchors = []
+        normal_components = []
+
+        for component in components:
+            name = component["name"]
+            # Check if node has any incoming edges
+            if name in graph and not any(v == name for u, v in graph.edges()):
+                anchors.append(name)
+            else:
+                normal_components.append(name)
+
+        return anchors, normal_components
+
+    # Add nodes
+    for component in parsed_map["components"]:
+        pos_str = component.get("pos", "[0, 0]")
+        x, y = json.loads(pos_str)
+        stage = component.get("evolution", "unknown")
+        node_color = evolution_colors.get(stage, "#f68b24")
+        G.add_node(
+            component["name"],
+            stage=stage,
+            visibility=component["visibility"],
+            pos=(x, y),
+            color=node_color
+        )
+
+    # Add edges
+    for link in parsed_map["links"]:
+        src, tgt = link["src"], link["tgt"]
+        if src in G and tgt in G:
+            G.add_edge(src, tgt)
+
+    # Process pipelines
+    for pipeline in parsed_map["pipelines"]:
+        pipeline_name = pipeline["name"]
+        pipeline_x = pipeline["x"]
+        pipeline_right_side = pipeline["y"]
+
+        matching_component = next(
+            (comp for comp in parsed_map["components"] if comp["name"] == pipeline_name),
+            None
+        )
+
+        if not matching_component:
+            st.sidebar.warning(f"Skipping pipeline '{pipeline_name}' - no matching component found.")
+            continue
+
+        _, pipeline_y = json.loads(matching_component["pos"])
+        pipeline_bottom = pipeline_y - 0.01
+
+        if pipeline_name not in G.nodes:
+            G.add_node(pipeline_name, type="pipeline", pos=(pipeline_x, pipeline_y))
+
+        for component_name in pipeline["components"]:
+            if component_name == pipeline_name:
+                continue
+
+            if component_name in G.nodes:
+                cx, cy = G.nodes[component_name]["pos"]
+                if (pipeline_x <= cx <= pipeline_right_side and
+                    pipeline_bottom <= cy <= pipeline_y):
+                    G.add_edge(pipeline_name, component_name)
+
+    # Get node positions and colors
+    pos = nx.get_node_attributes(G, 'pos')
+    colors = [G.nodes[node]['color'] for node in G]
+
+    # Identify anchors and normal components
+    anchors, normal_components = identify_node_types(G, parsed_map["components"])
+
+    # --- Create the animation ---
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.patch.set_facecolor('white')
+    ax.set_facecolor('white')
+    ax.set_xlim(-0.1, 1.1)
+    ax.set_ylim(-0.1, 1.1)
+    ax.set_xlabel("Evolution")
+    ax.set_ylabel("Value Chain")
+
+    def init():
+        ax.clear()
+        ax.set_xlim(-0.1, 1.1)
+        ax.set_ylim(-0.1, 1.1)
+        ax.set_xlabel("Evolution")
+        ax.set_ylabel("Value Chain")
+        nx.draw(G, pos, node_color=colors, with_labels=True, ax=ax)
+        return []
+
+    def update(frame):
+        ax.clear()
+        ax.set_xlim(-0.1, 1.1)
+        ax.set_ylim(-0.1, 1.1)
+        ax.set_xlabel("Evolution")
+        ax.set_ylabel("Value Chain")
+
+        if animation_type == "Components":
+            # Draw anchors
+            nx.draw_networkx_nodes(G, pos, nodelist=anchors, node_color="red", ax=ax)
+            anchor_edges = [(u, v) for (u, v) in G.edges() if u in anchors and v in anchors]
+            nx.draw_networkx_edges(G, pos, edgelist=anchor_edges, ax=ax)
+
+            # Reveal components progressively
+            shown_count = min(frame, len(normal_components))
+            shown_nodes = normal_components[:shown_count]
+            nx.draw_networkx_nodes(G, pos, nodelist=shown_nodes, node_color="blue", ax=ax)
+
+            # Draw edges for visible nodes
+            partial_edges = [(u, v) for (u, v) in G.edges()
+                           if (u in anchors or u in shown_nodes) and
+                              (v in anchors or v in shown_nodes)]
+            nx.draw_networkx_edges(G, pos, edgelist=partial_edges, ax=ax)
+
+            # Labels for visible nodes
+            label_dict = {n: n for n in anchors + shown_nodes}
+            nx.draw_networkx_labels(G, pos, labels=label_dict, ax=ax)
+
+        return []
+
+    # Create and display animation
+    ani = animation.FuncAnimation(
+        fig, update, frames=50, init_func=init, interval=animation_speed, blit=False
+    )
+
+    # Convert to HTML and display
+    html_ani = ani.to_jshtml()
+    st.components.v1.html(html_ani, height=700)
+    plt.close(fig)
